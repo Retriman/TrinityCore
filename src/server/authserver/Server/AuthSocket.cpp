@@ -27,6 +27,7 @@
 #include "RealmList.h"
 #include "AuthSocket.h"
 #include "AuthCodes.h"
+#include "TOTP.h"
 #include "SHA1.h"
 #include "openssl/crypto.h"
 
@@ -386,7 +387,7 @@ bool AuthSocket::_HandleLogonChallenge()
                 TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "[AuthChallenge] Account '%s' is locked to IP - '%s'", _login.c_str(), fields[3].GetCString());
                 TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "[AuthChallenge] Player address is '%s'", ip_address.c_str());
 
-                if (strcmp(fields[4].GetCString(), ip_address.c_str()))
+                if (strcmp(fields[4].GetCString(), ip_address.c_str()) != 0)
                 {
                     TC_LOG_DEBUG(LOG_FILTER_AUTHSERVER, "[AuthChallenge] Account IP differs");
                     pkt << uint8(WOW_FAIL_LOCKED_ENFORCED);
@@ -492,6 +493,12 @@ bool AuthSocket::_HandleLogonChallenge()
                     pkt.append(s.AsByteArray().get(), s.GetNumBytes());   // 32 bytes
                     pkt.append(unk3.AsByteArray(16).get(), 16);
                     uint8 securityFlags = 0;
+
+                    // Check if token is used
+                    _tokenKey = fields[8].GetString();
+                    if (!_tokenKey.empty())
+                        securityFlags = 4;
+
                     pkt << uint8(securityFlags);            // security flags (0x0...0x04)
 
                     if (securityFlags & 0x01)               // PIN input
@@ -651,6 +658,25 @@ bool AuthSocket::_HandleLogonProof()
         sha.Initialize();
         sha.UpdateBigNumbers(&A, &M, &K, NULL);
         sha.Finalize();
+
+        // Check auth token
+        if ((lp.securityFlags & 0x04) || !_tokenKey.empty())
+        {
+            uint8 size;
+            socket().recv((char*)&size, 1);
+            char* token = new char[size + 1];
+            token[size] = '\0';
+            socket().recv(token, size);
+            unsigned int validToken = TOTP::GenerateToken(_tokenKey.c_str());
+            unsigned int incomingToken = atoi(token);
+            delete[] token;
+            if (validToken != incomingToken)
+            {
+                char data[] = { AUTH_LOGON_PROOF, WOW_FAIL_UNKNOWN_ACCOUNT, 3, 0 };
+                socket().send(data, sizeof(data));
+                return false;
+            }
+        }
 
         if (_expversion & POST_BC_EXP_FLAG)                 // 2.x and 3.x clients
         {
@@ -904,12 +930,13 @@ bool AuthSocket::_HandleRealmList()
     size_t RealmListSize = 0;
     for (RealmList::RealmMap::const_iterator i = sRealmList->begin(); i != sRealmList->end(); ++i)
     {
+        const Realm &realm = i->second;
         // don't work with realms which not compatible with the client
-        bool okBuild = ((_expversion & POST_BC_EXP_FLAG) && i->second.gamebuild == _build) || ((_expversion & PRE_BC_EXP_FLAG) && !AuthHelper::IsPreBCAcceptedClientBuild(i->second.gamebuild));
+        bool okBuild = ((_expversion & POST_BC_EXP_FLAG) && realm.gamebuild == _build) || ((_expversion & PRE_BC_EXP_FLAG) && !AuthHelper::IsPreBCAcceptedClientBuild(realm.gamebuild));
 
         // No SQL injection. id of realm is controlled by the database.
-        uint32 flag = i->second.flag;
-        RealmBuildInfo const* buildInfo = AuthHelper::GetBuildInfo(i->second.gamebuild);
+        uint32 flag = realm.flag;
+        RealmBuildInfo const* buildInfo = AuthHelper::GetBuildInfo(realm.gamebuild);
         if (!okBuild)
         {
             if (!buildInfo)
@@ -930,27 +957,27 @@ bool AuthSocket::_HandleRealmList()
         }
 
         // We don't need the port number from which client connects with but the realm's port
-        clientAddr.set_port_number(i->second.ExternalAddress.get_port_number());
+        clientAddr.set_port_number(realm.ExternalAddress.get_port_number());
 
-        uint8 lock = (i->second.allowedSecurityLevel > _accountSecurityLevel) ? 1 : 0;
+        uint8 lock = (realm.allowedSecurityLevel > _accountSecurityLevel) ? 1 : 0;
 
         uint8 AmountOfCharacters = 0;
         stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_NUM_CHARS_ON_REALM);
-        stmt->setUInt32(0, i->second.m_ID);
+        stmt->setUInt32(0, realm.m_ID);
         stmt->setUInt32(1, id);
         result = LoginDatabase.Query(stmt);
         if (result)
             AmountOfCharacters = (*result)[0].GetUInt8();
 
-        pkt << i->second.icon;                              // realm type
+        pkt << realm.icon;                                  // realm type
         if (_expversion & POST_BC_EXP_FLAG)                 // only 2.x and 3.x clients
             pkt << lock;                                    // if 1, then realm locked
         pkt << uint8(flag);                                 // RealmFlags
         pkt << name;
-        pkt << GetAddressString(GetAddressForClient(i->second, clientAddr));
-        pkt << i->second.populationLevel;
+        pkt << GetAddressString(GetAddressForClient(realm, clientAddr));
+        pkt << realm.populationLevel;
         pkt << AmountOfCharacters;
-        pkt << i->second.timezone;                          // realm category
+        pkt << realm.timezone;                              // realm category
         if (_expversion & POST_BC_EXP_FLAG)                 // 2.x and 3.x clients
             pkt << uint8(0x2C);                             // unk, may be realm number/id?
         else
